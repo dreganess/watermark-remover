@@ -169,6 +169,16 @@ header {
 }
 .toast.show { opacity: 1; }
 
+/* ── BOTTOM BAR ── */
+.bottom-bar {
+  display: flex; justify-content: center; padding: 12px 16px;
+  background: #111; border-top: 1px solid #1e1e1e; flex-shrink: 0;
+}
+.btn-download {
+  padding: 14px 40px; font-size: 1rem; border-radius: 12px;
+  width: 100%; max-width: 400px;
+}
+
 /* ── COMPARE TOGGLE ── */
 .toggle-group { display: flex; border: 1px solid #2a2a2a; border-radius: 6px; overflow: hidden; }
 .toggle-btn {
@@ -198,10 +208,6 @@ header {
     <button class="btn btn-ghost" id="undoBtn" disabled>
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 14 4 9 9 4"/><path d="M20 20v-7a4 4 0 00-4-4H4"/></svg>
       Undo
-    </button>
-    <button class="btn btn-primary" id="downloadBtn" disabled>
-      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-      Download
     </button>
   </div>
 </header>
@@ -247,6 +253,14 @@ header {
         <p>Detecting &amp; removing watermark…</p>
       </div>
     </div>
+  </div>
+
+  <!-- Download button below the image -->
+  <div class="bottom-bar">
+    <button class="btn btn-primary btn-download" id="downloadBtn" disabled>
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+      Save Image
+    </button>
   </div>
 
   <div class="statusbar">
@@ -485,21 +499,30 @@ async function removeWatermark(rx, ry) {
 }
 
 // ── Download ───────────────────────────────────────────────────────────────────
+function dataURLtoBlob(dataURL) {
+  const [header, data] = dataURL.split(',');
+  const mime   = header.match(/:(.*?);/)[1];
+  const binary = atob(data);
+  const arr    = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) arr[i] = binary.charCodeAt(i);
+  return new Blob([arr], {type: mime});
+}
+
 downloadBtn.addEventListener('click', async () => {
   if (current === 0) return;
-  const res  = await fetch('/api/download', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({image: history[current]}),
-  });
-  const blob = await res.blob();
+  // Convert locally (no async fetch) so iOS preserves the user gesture for share
+  const blob = dataURLtoBlob(history[current]);
   const file = new File([blob], 'watermark-removed.png', {type: 'image/png'});
 
-  // iOS: use the Share Sheet so user can tap "Save Image" → Camera Roll
+  // iOS: Share Sheet → "Save Image" → Camera Roll
   if (navigator.canShare && navigator.canShare({files: [file]})) {
-    await navigator.share({files: [file], title: 'Watermark Removed'});
+    try {
+      await navigator.share({files: [file], title: 'Watermark Removed'});
+    } catch (e) {
+      if (e.name !== 'AbortError') showToast('Could not open share sheet');
+    }
   } else {
-    // Desktop fallback: normal file download
+    // Desktop: normal file download
     const url = URL.createObjectURL(blob);
     const a   = document.createElement('a');
     a.href = url; a.download = 'watermark-removed.png';
