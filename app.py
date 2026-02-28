@@ -1,7 +1,8 @@
 import base64
 import cv2
 import numpy as np
-from flask import Flask, jsonify, render_template, request
+import io
+from flask import Flask, jsonify, render_template, request, send_file
 
 app = Flask(__name__)
 MAX_SIDE = 2048
@@ -105,6 +106,19 @@ def remove():
     result = cv2.inpaint(result, mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
 
     return jsonify({"result": encode_b64(result)})
+
+
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.get_json(force=True)
+    _, enc = data["image"].split(",", 1)
+    img_bytes = base64.b64decode(enc)
+    return send_file(
+        io.BytesIO(img_bytes),
+        mimetype="image/png",
+        as_attachment=True,
+        download_name="watermark-removed.png",
+    )
 
 
 app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024  # 20 MB max upload

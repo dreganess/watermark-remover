@@ -485,12 +485,24 @@ async function removeWatermark(rx, ry) {
 }
 
 // ── Download ───────────────────────────────────────────────────────────────────
-downloadBtn.addEventListener('click', () => {
+downloadBtn.addEventListener('click', async () => {
   if (current === 0) return;
-  const a = document.createElement('a');
-  a.href = history[current];
+  // POST image to server and receive it back as a real file download
+  // (required for iOS Safari which ignores the `download` attribute on data URLs)
+  const res = await fetch('/api/download', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({image: history[current]}),
+  });
+  const blob = await res.blob();
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
   a.download = 'watermark-removed.png';
+  document.body.appendChild(a);
   a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 });
 </script>
 </body>
