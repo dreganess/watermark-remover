@@ -373,7 +373,12 @@ viewToggle.addEventListener('click', e => {
 function renderHistory() {
   const src = viewMode === 'original' ? history[0] : history[current];
   const img = new Image();
-  img.onload = () => ctx.drawImage(img, 0, 0);
+  img.onload = () => {
+    canvas.width  = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    ctx.drawImage(img, 0, 0);
+    statusDim.textContent = `${img.naturalWidth} × ${img.naturalHeight}`;
+  };
   img.src = src;
 }
 
@@ -477,7 +482,10 @@ async function removeWatermark(rx, ry) {
 
     const img = new Image();
     img.onload = () => {
+      canvas.width  = img.naturalWidth;
+      canvas.height = img.naturalHeight;
       ctx.drawImage(img, 0, 0);
+      statusDim.textContent = `${img.naturalWidth} × ${img.naturalHeight}`;
       viewMode = 'current';
       document.querySelectorAll('.toggle-btn').forEach(b => b.classList.toggle('active', b.dataset.view === 'current'));
       viewToggle.style.display = '';
