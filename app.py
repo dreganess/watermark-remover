@@ -80,6 +80,13 @@ def build_mask(img: np.ndarray, cx: int, cy: int,
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
 
+@app.after_request
+def no_cache(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
 @app.route("/")
 def index():
     return render_template("index.html")
