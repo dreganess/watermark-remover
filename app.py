@@ -32,12 +32,11 @@ def limit_size(img: np.ndarray) -> np.ndarray:
 # ── Watermark detection ────────────────────────────────────────────────────────
 
 def build_mask(img: np.ndarray, cx: int, cy: int,
-               base_radius: int = 55, tolerance: int = 32) -> np.ndarray:
+               base_radius: int = 38, tolerance: int = 32) -> np.ndarray:
     """
-    Given a click point (cx, cy), detect the watermark shape using:
-      1. Flood-fill from the click pixel to capture connected similar pixels
-      2. A guaranteed minimum circle so a mis-click still erases something
-    Returns a binary mask (same HxW as img).
+    Build a tight mask around the clicked watermark using flood-fill plus
+    a guaranteed minimum circle. Smaller radius and dilation mean less
+    background gets erased, giving the inpainting algorithm less to reconstruct.
     """
     h, w = img.shape[:2]
     cx = int(np.clip(cx, 0, w - 1))
@@ -71,11 +70,29 @@ def build_mask(img: np.ndarray, cx: int, cy: int,
     full = np.zeros((h, w), np.uint8)
     full[y1:y2, x1:x2] = combined
 
-    # Dilate so inpainting covers the semi-transparent fringe
-    k = np.ones((7, 7), np.uint8)
-    full = cv2.dilate(full, k, iterations=3)
+    # Lighter dilation — just enough to cover semi-transparent fringe
+    k = np.ones((5, 5), np.uint8)
+    full = cv2.dilate(full, k, iterations=2)
 
     return full
+
+
+def smooth_edges(result: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Apply a gentle Gaussian blur in a narrow ring just inside and outside
+    the mask boundary. This hides the hard seam between inpainted and
+    original pixels without affecting the interior or the rest of the image.
+    """
+    k = np.ones((7, 7), np.uint8)
+    inner = cv2.erode(mask, k, iterations=2)
+    outer = cv2.dilate(mask, k, iterations=2)
+    boundary = (outer > 0) & (inner == 0)          # ring around the mask edge
+
+    blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=2.5)
+
+    out = result.copy()
+    out[boundary] = blurred[boundary]
+    return out
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -106,11 +123,11 @@ def remove():
 
     mask = build_mask(img, cx, cy)
 
-    # TELEA inpainting with a generous radius for smooth reconstruction
-    result = cv2.inpaint(img, mask, inpaintRadius=18, flags=cv2.INPAINT_TELEA)
+    # TELEA inpainting — larger radius searches further for matching texture
+    result = cv2.inpaint(img, mask, inpaintRadius=22, flags=cv2.INPAINT_TELEA)
 
-    # Optional: second lighter pass with NS to smooth residual artifacts
-    result = cv2.inpaint(result, mask, inpaintRadius=5, flags=cv2.INPAINT_NS)
+    # Smooth the boundary ring so the patch blends into the surrounding image
+    result = smooth_edges(result, mask)
 
     return jsonify({"result": encode_b64(result)})
 
