@@ -33,16 +33,10 @@ def limit_size(img: np.ndarray) -> np.ndarray:
 
 def build_mask(img: np.ndarray, cx: int, cy: int,
                base_radius: int = 38, tolerance: int = 32) -> np.ndarray:
-    """
-    Build a tight mask around the clicked watermark using flood-fill plus
-    a guaranteed minimum circle. Smaller radius and dilation mean less
-    background gets erased, giving the inpainting algorithm less to reconstruct.
-    """
     h, w = img.shape[:2]
     cx = int(np.clip(cx, 0, w - 1))
     cy = int(np.clip(cy, 0, h - 1))
 
-    # ROI around the click
     sr = base_radius + 40
     x1, y1 = max(0, cx - sr), max(0, cy - sr)
     x2, y2 = min(w, cx + sr), min(h, cy + sr)
@@ -63,36 +57,51 @@ def build_mask(img: np.ndarray, cx: int, cy: int,
     region_circ = np.zeros((rh, rw), np.uint8)
     cv2.circle(region_circ, (sx, sy), base_radius, 255, -1)
 
-    # Union: accept whichever is larger
     combined = cv2.bitwise_or(region_ff, region_circ)
 
-    # Place into full-image mask
     full = np.zeros((h, w), np.uint8)
     full[y1:y2, x1:x2] = combined
 
-    # Lighter dilation — just enough to cover semi-transparent fringe
     k = np.ones((5, 5), np.uint8)
     full = cv2.dilate(full, k, iterations=2)
 
     return full
 
 
-def smooth_edges(result: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def poisson_blend(original: np.ndarray, inpainted: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
-    Apply a gentle Gaussian blur in a narrow ring just inside and outside
-    the mask boundary. This hides the hard seam between inpainted and
-    original pixels without affecting the interior or the rest of the image.
+    Use Poisson blending (seamlessClone) to integrate the inpainted patch into
+    the original image. The solver automatically matches colour gradients at the
+    boundary — no visible seam or blur.
+
+    Pads the image before blending so corners and edges are handled correctly,
+    then crops back to the original size.
     """
-    k = np.ones((7, 7), np.uint8)
-    inner = cv2.erode(mask, k, iterations=2)
-    outer = cv2.dilate(mask, k, iterations=2)
-    boundary = (outer > 0) & (inner == 0)          # ring around the mask edge
+    h, w = original.shape[:2]
+    ys, xs = np.where(mask > 0)
+    if len(ys) == 0:
+        return inpainted
 
-    blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=2.5)
+    cx_c = int((int(xs.min()) + int(xs.max())) / 2)
+    cy_c = int((int(ys.min()) + int(ys.max())) / 2)
 
-    out = result.copy()
-    out[boundary] = blurred[boundary]
-    return out
+    # Radius of the mask bounding box
+    r = max(int(xs.max()) - int(xs.min()), int(ys.max()) - int(ys.min())) // 2 + 15
+
+    # How far the centre is from the nearest edge
+    margin = min(cx_c, cy_c, w - cx_c - 1, h - cy_c - 1)
+
+    # Pad just enough so seamlessClone has room — critical for corner watermarks
+    pad = max(0, r - margin + 5)
+    if pad > 0:
+        orig_p = cv2.copyMakeBorder(original,  pad, pad, pad, pad, cv2.BORDER_REFLECT)
+        inp_p  = cv2.copyMakeBorder(inpainted, pad, pad, pad, pad, cv2.BORDER_REFLECT)
+        mask_p = cv2.copyMakeBorder(mask,      pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
+        center = (cx_c + pad, cy_c + pad)
+        blended = cv2.seamlessClone(inp_p, orig_p, mask_p, center, cv2.NORMAL_CLONE)
+        return blended[pad:pad + h, pad:pad + w]
+
+    return cv2.seamlessClone(inpainted, original, mask, (cx_c, cy_c), cv2.NORMAL_CLONE)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -117,17 +126,19 @@ def remove():
     img = limit_size(img)
     h, w = img.shape[:2]
 
-    # Coordinates are sent as 0-1 ratios relative to display canvas
     cx = int(data["x"] * w)
     cy = int(data["y"] * h)
 
     mask = build_mask(img, cx, cy)
 
-    # TELEA inpainting — larger radius searches further for matching texture
-    result = cv2.inpaint(img, mask, inpaintRadius=22, flags=cv2.INPAINT_TELEA)
+    # Step 1: reconstruct the background texture with TELEA inpainting
+    inpainted = cv2.inpaint(img, mask, inpaintRadius=22, flags=cv2.INPAINT_TELEA)
 
-    # Smooth the boundary ring so the patch blends into the surrounding image
-    result = smooth_edges(result, mask)
+    # Step 2: Poisson-blend the patch back in — auto colour-matches the boundary
+    try:
+        result = poisson_blend(img, inpainted, mask)
+    except Exception:
+        result = inpainted  # fallback to plain inpainting if blend fails
 
     return jsonify({"result": encode_b64(result)})
 
