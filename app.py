@@ -29,79 +29,70 @@ def limit_size(img: np.ndarray) -> np.ndarray:
     return img
 
 
-# ── Watermark detection ────────────────────────────────────────────────────────
+# ── Watermark mask ────────────────────────────────────────────────────────────
 
-def build_mask(img: np.ndarray, cx: int, cy: int,
-               base_radius: int = 38, tolerance: int = 32) -> np.ndarray:
+def build_mask(img: np.ndarray, cx: int, cy: int) -> np.ndarray:
+    """
+    Build a tight mask around the clicked watermark.
+
+    For bright watermarks (sparkles, logos): use luminance thresholding within
+    the click radius so only the actual bright watermark pixels are masked —
+    not the surrounding background.
+
+    For other watermarks: fall back to colour-similarity flood fill.
+    """
     h, w = img.shape[:2]
     cx = int(np.clip(cx, 0, w - 1))
     cy = int(np.clip(cy, 0, h - 1))
 
-    sr = base_radius + 40
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    click_lum = int(gray[cy, cx])
+
+    sr = 80  # search radius
     x1, y1 = max(0, cx - sr), max(0, cy - sr)
     x2, y2 = min(w, cx + sr), min(h, cy + sr)
-    roi = img[y1:y2, x1:x2].copy()
-    rh, rw = roi.shape[:2]
+    roi     = img[y1:y2,  x1:x2].copy()
+    roi_g   = gray[y1:y2, x1:x2]
+    rh, rw  = roi.shape[:2]
+    sx = cx - x1
+    sy = cy - y1
 
-    sx = int(np.clip(cx - x1, 0, rw - 1))
-    sy = int(np.clip(cy - y1, 0, rh - 1))
+    # ── Method A: colour flood fill from click ─────────────────────────────
+    flood = np.zeros((rh + 2, rw + 2), np.uint8)
+    cv2.floodFill(roi, flood, (sx, sy), 0,
+                  (30,) * 3, (30,) * 3,
+                  4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8))
+    region_ff = flood[1:-1, 1:-1]
 
-    # --- Flood fill from click ---
-    flood_mask = np.zeros((rh + 2, rw + 2), np.uint8)
-    diff = (tolerance,) * 3
-    flags = 4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8)
-    cv2.floodFill(roi, flood_mask, (sx, sy), 0, diff, diff, flags)
-    region_ff = flood_mask[1:-1, 1:-1]
+    # ── Method B: luminance threshold (for bright sparkle/logo watermarks) ─
+    region_lum = np.zeros((rh, rw), np.uint8)
+    if click_lum > 160:                         # clicked on a bright watermark
+        threshold = max(click_lum - 60, 160)    # adaptive: capture similar-bright pixels
+        bright = (roi_g >= threshold).astype(np.uint8) * 255
+        # Only keep bright pixels connected to the click
+        conn_mask = np.zeros((rh + 2, rw + 2), np.uint8)
+        cv2.floodFill(bright.copy(), conn_mask, (sx, sy), 0,
+                      (40,), (40,),
+                      4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8))
+        region_lum = conn_mask[1:-1, 1:-1]
 
-    # --- Minimum guaranteed circle ---
-    region_circ = np.zeros((rh, rw), np.uint8)
-    cv2.circle(region_circ, (sx, sy), base_radius, 255, -1)
+    # ── Union of both, clipped to a 70 px radius circle ───────────────────
+    combined = cv2.bitwise_or(region_ff, region_lum)
+    circle   = np.zeros((rh, rw), np.uint8)
+    cv2.circle(circle, (sx, sy), 70, 255, -1)
+    combined = cv2.bitwise_and(combined, circle)
 
-    combined = cv2.bitwise_or(region_ff, region_circ)
+    # Fallback: if nothing was detected, use a small guaranteed circle
+    if combined.sum() == 0:
+        cv2.circle(combined, (sx, sy), 30, 255, -1)
 
     full = np.zeros((h, w), np.uint8)
     full[y1:y2, x1:x2] = combined
 
-    k = np.ones((5, 5), np.uint8)
-    full = cv2.dilate(full, k, iterations=2)
+    # Minimal dilation — just covers semi-transparent fringe
+    full = cv2.dilate(full, np.ones((3, 3), np.uint8), iterations=1)
 
     return full
-
-
-def poisson_blend(original: np.ndarray, inpainted: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """
-    Use Poisson blending (seamlessClone) to integrate the inpainted patch into
-    the original image. The solver automatically matches colour gradients at the
-    boundary — no visible seam or blur.
-
-    Pads the image before blending so corners and edges are handled correctly,
-    then crops back to the original size.
-    """
-    h, w = original.shape[:2]
-    ys, xs = np.where(mask > 0)
-    if len(ys) == 0:
-        return inpainted
-
-    cx_c = int((int(xs.min()) + int(xs.max())) / 2)
-    cy_c = int((int(ys.min()) + int(ys.max())) / 2)
-
-    # Radius of the mask bounding box
-    r = max(int(xs.max()) - int(xs.min()), int(ys.max()) - int(ys.min())) // 2 + 15
-
-    # How far the centre is from the nearest edge
-    margin = min(cx_c, cy_c, w - cx_c - 1, h - cy_c - 1)
-
-    # Pad just enough so seamlessClone has room — critical for corner watermarks
-    pad = max(0, r - margin + 5)
-    if pad > 0:
-        orig_p = cv2.copyMakeBorder(original,  pad, pad, pad, pad, cv2.BORDER_REFLECT)
-        inp_p  = cv2.copyMakeBorder(inpainted, pad, pad, pad, pad, cv2.BORDER_REFLECT)
-        mask_p = cv2.copyMakeBorder(mask,      pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
-        center = (cx_c + pad, cy_c + pad)
-        blended = cv2.seamlessClone(inp_p, orig_p, mask_p, center, cv2.NORMAL_CLONE)
-        return blended[pad:pad + h, pad:pad + w]
-
-    return cv2.seamlessClone(inpainted, original, mask, (cx_c, cy_c), cv2.NORMAL_CLONE)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -131,14 +122,10 @@ def remove():
 
     mask = build_mask(img, cx, cy)
 
-    # Step 1: reconstruct the background texture with TELEA inpainting
-    inpainted = cv2.inpaint(img, mask, inpaintRadius=22, flags=cv2.INPAINT_TELEA)
-
-    # Step 2: Poisson-blend the patch back in — auto colour-matches the boundary
-    try:
-        result = poisson_blend(img, inpainted, mask)
-    except Exception:
-        result = inpainted  # fallback to plain inpainting if blend fails
+    # TELEA inpainting — propagates surrounding texture into the masked region.
+    # No post-processing: blur and Poisson blending both introduce visible
+    # circular artifacts that look worse than plain inpainting.
+    result = cv2.inpaint(img, mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
 
     return jsonify({"result": encode_b64(result)})
 
