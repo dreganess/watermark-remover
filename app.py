@@ -7,6 +7,18 @@ from flask import Flask, jsonify, render_template, request, send_file
 app = Flask(__name__)
 MAX_SIDE = 2048
 
+# ── LaMa model (loaded once at startup) ───────────────────────────────────────
+# simple-lama-inpainting wraps the LaMa open-source inpainting model.
+# Falls back to OpenCV TELEA if the package isn't available.
+_lama = None
+try:
+    from PIL import Image as PILImage
+    from simple_lama_inpainting import SimpleLama
+    _lama = SimpleLama()
+    print("LaMa model loaded successfully")
+except Exception as e:
+    print(f"LaMa unavailable, falling back to TELEA: {e}")
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -29,17 +41,14 @@ def limit_size(img: np.ndarray) -> np.ndarray:
     return img
 
 
-# ── Watermark mask ────────────────────────────────────────────────────────────
+# ── Watermark mask ─────────────────────────────────────────────────────────────
 
 def build_mask(img: np.ndarray, cx: int, cy: int) -> np.ndarray:
     """
     Build a tight mask around the clicked watermark.
-
-    For bright watermarks (sparkles, logos): use luminance thresholding within
-    the click radius so only the actual bright watermark pixels are masked —
-    not the surrounding background.
-
-    For other watermarks: fall back to colour-similarity flood fill.
+    For bright watermarks (sparkles, logos): uses luminance thresholding so
+    only the actual watermark pixels are masked.
+    For other watermarks: falls back to colour-similarity flood fill.
     """
     h, w = img.shape[:2]
     cx = int(np.clip(cx, 0, w - 1))
@@ -48,51 +57,62 @@ def build_mask(img: np.ndarray, cx: int, cy: int) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     click_lum = int(gray[cy, cx])
 
-    sr = 80  # search radius
+    sr = 80
     x1, y1 = max(0, cx - sr), max(0, cy - sr)
     x2, y2 = min(w, cx + sr), min(h, cy + sr)
-    roi     = img[y1:y2,  x1:x2].copy()
-    roi_g   = gray[y1:y2, x1:x2]
-    rh, rw  = roi.shape[:2]
-    sx = cx - x1
-    sy = cy - y1
+    roi   = img[y1:y2, x1:x2].copy()
+    roi_g = gray[y1:y2, x1:x2]
+    rh, rw = roi.shape[:2]
+    sx, sy = cx - x1, cy - y1
 
-    # ── Method A: colour flood fill from click ─────────────────────────────
+    # Method A: colour flood fill
     flood = np.zeros((rh + 2, rw + 2), np.uint8)
     cv2.floodFill(roi, flood, (sx, sy), 0,
                   (30,) * 3, (30,) * 3,
                   4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8))
     region_ff = flood[1:-1, 1:-1]
 
-    # ── Method B: luminance threshold (for bright sparkle/logo watermarks) ─
+    # Method B: luminance threshold for bright sparkle/logo watermarks
     region_lum = np.zeros((rh, rw), np.uint8)
-    if click_lum > 160:                         # clicked on a bright watermark
-        threshold = max(click_lum - 60, 160)    # adaptive: capture similar-bright pixels
+    if click_lum > 160:
+        threshold = max(click_lum - 60, 160)
         bright = (roi_g >= threshold).astype(np.uint8) * 255
-        # Only keep bright pixels connected to the click
-        conn_mask = np.zeros((rh + 2, rw + 2), np.uint8)
-        cv2.floodFill(bright.copy(), conn_mask, (sx, sy), 0,
+        conn = np.zeros((rh + 2, rw + 2), np.uint8)
+        cv2.floodFill(bright.copy(), conn, (sx, sy), 0,
                       (40,), (40,),
                       4 | cv2.FLOODFILL_MASK_ONLY | (255 << 8))
-        region_lum = conn_mask[1:-1, 1:-1]
+        region_lum = conn[1:-1, 1:-1]
 
-    # ── Union of both, clipped to a 70 px radius circle ───────────────────
     combined = cv2.bitwise_or(region_ff, region_lum)
-    circle   = np.zeros((rh, rw), np.uint8)
+    circle = np.zeros((rh, rw), np.uint8)
     cv2.circle(circle, (sx, sy), 70, 255, -1)
     combined = cv2.bitwise_and(combined, circle)
 
-    # Fallback: if nothing was detected, use a small guaranteed circle
     if combined.sum() == 0:
         cv2.circle(combined, (sx, sy), 30, 255, -1)
 
     full = np.zeros((h, w), np.uint8)
     full[y1:y2, x1:x2] = combined
-
-    # Minimal dilation — just covers semi-transparent fringe
     full = cv2.dilate(full, np.ones((3, 3), np.uint8), iterations=1)
-
     return full
+
+
+# ── Inpainting ─────────────────────────────────────────────────────────────────
+
+def inpaint(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Use LaMa AI model if available, otherwise fall back to OpenCV TELEA.
+    LaMa produces seamless, context-aware results even for complex backgrounds.
+    """
+    if _lama is not None:
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_img  = PILImage.fromarray(img_rgb)
+        pil_mask = PILImage.fromarray(mask)
+        result_pil = _lama(pil_img, pil_mask)
+        return cv2.cvtColor(np.array(result_pil), cv2.COLOR_RGB2BGR)
+
+    # Fallback
+    return cv2.inpaint(img_bgr, mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -121,11 +141,7 @@ def remove():
     cy = int(data["y"] * h)
 
     mask = build_mask(img, cx, cy)
-
-    # TELEA inpainting — propagates surrounding texture into the masked region.
-    # No post-processing: blur and Poisson blending both introduce visible
-    # circular artifacts that look worse than plain inpainting.
-    result = cv2.inpaint(img, mask, inpaintRadius=15, flags=cv2.INPAINT_TELEA)
+    result = inpaint(img, mask)
 
     return jsonify({"result": encode_b64(result)})
 
